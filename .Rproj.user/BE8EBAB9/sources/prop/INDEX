@@ -1,0 +1,6 @@
+~%2FProject%2FIFLS5%2Fifls5_risk_preference%2F.gitignore="75318764"
+~%2FProject%2FIFLS5%2Fifls5_risk_preference%2Fscripts%2F01_data_prep.R="1B9492CB"
+~%2FProject%2FIFLS5%2Fifls5_risk_preference%2Fscripts%2F02_feature_engineering.R="A70CEC4E"
+~%2FProject%2FIFLS5%2Fifls5_risk_preference%2Fscripts%2F03_modeling.R="991F1B5D"
+~%2FProject%2FIFLS5%2Fifls5_risk_preference%2Fscripts%2F04_export.R="A1D5023C"
+~%2FProject%2FIFLS5%2Fifls5_risk_preference%2Fscripts%2Fapp.R="F703278A"

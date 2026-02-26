@@ -1,0 +1,27 @@
+{
+    "id": "0B1248D0",
+    "path": "~/Project/IFLS5/ifls5_risk_preference/scripts/app.R",
+    "project_path": "scripts/app.R",
+    "type": "r_source",
+    "hash": "3032000202",
+    "contents": "",
+    "dirty": false,
+    "created": 1772117277698.0,
+    "source_on_save": false,
+    "relative_order": 6,
+    "properties": {
+        "tempName": "Untitled1",
+        "source_window_id": "",
+        "Source": "Source",
+        "cursorPosition": "24,20",
+        "scrollLine": "0"
+    },
+    "folds": "",
+    "lastKnownWriteTime": 1772117284,
+    "encoding": "UTF-8",
+    "collab_server": "",
+    "source_window": "",
+    "last_content_update": 1772117284037,
+    "read_only": false,
+    "read_only_alternatives": []
+}
