@@ -1,0 +1,265 @@
+---
+title: "Robustness Check: 5-Group Risk Index"
+output: html_document
+date: "2026-03"
+---
+
+# Robustness Check — 5-Group Risk Index (Include Gamble Averse)
+
+Cek apakah hasil baseline robust kalau responden `gamble_averse` **tidak dieksklusi**, melainkan dijadikan kelompok ke-0 (paling risk averse) dalam skala 5-grup (0–4). Argumennya: gamble averse bukan "data invalid" — mereka tetap responden dengan preferensi risk yang ekstrem (refuse semua gamble, bahkan yang dominan). Mengeksklusi mereka berisiko *selection bias*; memasukkan mereka memperluas variasi di ujung distribusi.
+
+## Setup
+
+Load tiga dataset processed dari pipeline utama. Tidak load analytic_sample karena di sini perlu **rebuild sample dengan filter yang berbeda** (include `gamble_averse`).
+
+```{r setup}
+library(MASS)
+library(tidyverse)
+
+risk <- readRDS("data/processed/risk_index.rds")
+bfi  <- readRDS("data/processed/big_five.rds")
+cog  <- readRDS("data/processed/cognitive.rds")
+```
+
+## Reconstruct Merge — Include Gamble-Averse
+
+Replikasi seluruh logika dari `04_merge_feature.Rmd` **tanpa** filter `!is.na(risk_s1)`. Yang di-keep: `screen_s1 %in% c("eligible", "eligible_corrected", "gamble_averse")` — jadi hanya `missing` yang di-drop. Demo, geo, education, employment di-construct ulang persis sama dengan script 04 supaya hasil 100% comparable.
+
+```{r merge}
+ptrack <- haven::read_dta("data/raw/ptrack.dta")
+htrack <- haven::read_dta("data/raw/htrack.dta")
+dl_raw <- haven::read_dta("data/raw/b3a_dl1.dta")
+tk_raw <- haven::read_dta("data/raw/b3a_tk1.dta")
+bk_raw <- haven::read_dta("data/raw/bk_sc1.dta")
+
+names(ptrack) <- tolower(names(ptrack))
+names(htrack) <- tolower(names(htrack))
+names(dl_raw) <- tolower(names(dl_raw))
+names(tk_raw) <- tolower(names(tk_raw))
+names(bk_raw) <- tolower(names(bk_raw))
+
+# Demo
+demo <- ptrack |>
+  mutate(across(where(~ inherits(., "haven_labelled")), ~ as.numeric(as.character(.)))) |>
+  dplyr::select(pidlink, age = age_14, sex) |>
+  filter(!is.na(age)) |>
+  mutate(female = as.integer(sex == 3), age_sq = age^2) |>
+  dplyr::select(pidlink, age, age_sq, female)
+
+# Geo
+geo_hh <- htrack |>
+  mutate(across(where(~ inherits(., "haven_labelled")), ~ as.numeric(as.character(.)))) |>
+  dplyr::select(hhid14_9, province = sc01_14_14)
+
+urban_hh <- bk_raw |>
+  mutate(across(where(~ inherits(., "haven_labelled")), ~ as.numeric(as.character(.)))) |>
+  dplyr::select(hhid14_9, urban = sc05) |>
+  mutate(rural = as.integer(urban == 2)) |>
+  dplyr::select(hhid14_9, rural)
+
+geo <- geo_hh |>
+  left_join(urban_hh, by = "hhid14_9") |>
+  filter(!is.na(province)) |>
+  mutate(province = factor(province))
+
+pid_hh <- ptrack |>
+  dplyr::select(pidlink, hhid14_9) |>
+  filter(!is.na(hhid14_9))
+
+geo_pid <- pid_hh |>
+  left_join(geo, by = "hhid14_9") |>
+  dplyr::select(pidlink, province, rural)
+
+# Education
+educ <- dl_raw |>
+  mutate(across(where(~ inherits(., "haven_labelled")), ~ as.numeric(as.character(.)))) |>
+  dplyr::select(pidlink, dl06, dl07) |>
+  mutate(
+    dl07_clean = if_else(dl07 %in% c(98, 99), NA_real_, dl07),
+    educ_years = case_when(
+      dl06 == 1 | is.na(dl06)       ~ 0,
+      dl06 %in% c(2, 11, 14, 72)    ~ pmin(dl07_clean, 6, na.rm = TRUE),
+      dl06 %in% c(3, 4, 12, 73)     ~ 6 + pmin(dl07_clean, 3, na.rm = TRUE),
+      dl06 %in% c(5, 6, 13, 74)     ~ 9 + pmin(dl07_clean, 3, na.rm = TRUE),
+      dl06 == 60                     ~ 12 + pmin(dl07_clean, 3, na.rm = TRUE),
+      dl06 %in% c(61)               ~ 12 + pmin(dl07_clean, 4, na.rm = TRUE),
+      dl06 %in% c(62)               ~ 16 + pmin(dl07_clean, 2, na.rm = TRUE),
+      dl06 %in% c(63)               ~ 18 + pmin(dl07_clean, 3, na.rm = TRUE),
+      TRUE                          ~ NA_real_
+    ),
+    educ_years = if_else(dl07 == 7 & dl06 %in% c(2, 72), 6, educ_years),
+    educ_years = if_else(dl07 == 7 & dl06 %in% c(3, 4, 73), 9, educ_years),
+    educ_years = if_else(dl07 == 7 & dl06 %in% c(5, 6, 74), 12, educ_years),
+    educ_years = if_else(dl07 == 7 & dl06 == 60, 15, educ_years),
+    educ_years = if_else(dl07 == 7 & dl06 == 61, 16, educ_years),
+    educ_years = if_else(dl07 == 7 & dl06 == 62, 18, educ_years),
+    educ_years = if_else(dl07 == 7 & dl06 == 63, 21, educ_years)
+  ) |>
+  dplyr::select(pidlink, educ_years)
+
+# Employment
+employ <- tk_raw |>
+  mutate(across(where(~ inherits(., "haven_labelled")), ~ as.numeric(as.character(.)))) |>
+  dplyr::select(pidlink, tk01) |>
+  mutate(employed = as.integer(tk01 == 1)) |>
+  dplyr::select(pidlink, employed)
+
+# MERGE — keep gamble_averse + eligible (NOT filtering !is.na(risk_s1))
+df <- risk |>
+  filter(screen_s1 %in% c("eligible", "eligible_corrected", "gamble_averse")) |>
+  left_join(bfi, by = "pidlink") |>
+  left_join(cog, by = "pidlink") |>
+  left_join(demo, by = "pidlink") |>
+  left_join(geo_pid, by = "pidlink") |>
+  left_join(educ, by = "pidlink") |>
+  left_join(employ, by = "pidlink") |>
+  filter(age >= 18, age <= 65)
+
+cat("After merge + age filter:", nrow(df), "rows\n")
+df |> count(screen_s1)
+```
+
+## Construct 5-Group Index
+
+Buat `risk_5g` dengan logika:
+
+- `screen_s1 == "gamble_averse"` → **Group 0** (paling risk averse)
+- `eligible*` → ambil `risk_s1` apa adanya (1–4)
+
+Hasilnya skala ordinal 0–4. Konversi ke factor ordered untuk `polr`. Bonus: center age di sini juga (sama seperti baseline) supaya formula tinggal pakai langsung.
+
+```{r construct}
+df <- df %>%
+  mutate(
+    risk_5g = case_when(
+      screen_s1 == "gamble_averse"                       ~ 0L,
+      screen_s1 %in% c("eligible", "eligible_corrected") ~ as.integer(risk_s1),
+      TRUE                                                ~ NA_integer_
+    ),
+    risk_5g_ord = factor(risk_5g, levels = 0:4, ordered = TRUE),
+    age_c  = age - mean(age, na.rm = TRUE),
+    age_c2 = age_c^2
+  ) %>%
+  filter(!is.na(risk_5g))
+
+df %>% count(risk_5g) %>%
+  mutate(pct = round(n / sum(n) * 100, 1))
+```
+
+## Complete Cases
+
+Listwise deletion ke complete cases di seluruh prediktor — sama strategi dengan baseline supaya AIC comparable. Note: `risk_5g_ord` masuk model_vars supaya kalau ada NA di target juga ke-drop (defensive).
+
+```{r complete_cases}
+psn_items  <- c(paste0("psn_0", c(1:3, 6:8)), paste0("psn_", c(10:13, 15)),
+                "psn_04r", "psn_05r", "psn_09r", "psn_14r")
+cog_vars   <- c("co07count", "co10count", "serial7_score", "memory_self",
+                "wscore", "raven_score")
+demo_vars  <- c("age_c", "age_c2", "female", "educ_years", "rural", "employed")
+trait_vars <- c("openness", "conscientiousness", "extraversion",
+                "agreeableness", "neuroticism")
+
+model_vars <- c("risk_5g_ord", psn_items, cog_vars, demo_vars, trait_vars)
+
+df_model <- df %>%
+  dplyr::select(all_of(model_vars)) %>%
+  drop_na()
+
+cat("N complete cases:", nrow(df_model), "\n")
+```
+
+## Model Specifications
+
+5 spesifikasi paralel dengan baseline (script 05) — supaya bisa langsung dibandingkan AIC ranking-nya. Helper `make_formula` bikin formula reusable: tinggal pass list prediktor, output sudah `formula` object yang siap di-feed ke `polr`/`lm`.
+
+```{r specs}
+make_formula <- function(predictors, outcome = "risk_5g_ord") {
+  as.formula(paste(outcome, "~", paste(predictors, collapse = " + ")))
+}
+
+specs <- list(
+  demo_only       = make_formula(demo_vars),
+  trait_comp_demo = make_formula(c(trait_vars, demo_vars)),
+  psn_items_demo  = make_formula(c(psn_items, demo_vars)),
+  cog_demo        = make_formula(c(cog_vars, demo_vars)),
+  full            = make_formula(c(psn_items, cog_vars, demo_vars))
+)
+```
+
+## Fit Ordered Logit + AIC Comparison
+
+Fit semua spesifikasi via `purrr::map`, lalu rangking by AIC. Kalau **ranking AIC tetap sama** dengan baseline 4-group (full > psn+demo > cog+demo > trait+demo > demo_only, atau sejenisnya), berarti hasil baseline robust ke pilihan eksklusi vs inklusi gamble averse — temuan kuat untuk paper.
+
+```{r ologit}
+ologit_fits <- map(specs, ~ polr(.x, data = df_model, Hess = TRUE))
+
+aic_table <- tibble(
+  model  = c("demo_only", "psn_items+demo", "cog+demo",
+             "full (items+cog+demo)", "trait_composites+demo"),
+  AIC    = map_dbl(ologit_fits[c(1,3,4,5,2)], AIC),
+  BIC    = map_dbl(ologit_fits[c(1,3,4,5,2)], BIC),
+  logLik = map_dbl(ologit_fits[c(1,3,4,5,2)], ~ as.numeric(logLik(.x)))
+) %>%
+  mutate(delta_AIC = AIC - min(AIC)) %>%
+  arrange(AIC)
+
+print(aic_table)
+```
+
+## Full OLS
+
+OLS sebagai robustness check tambahan (sama logikanya dengan baseline). Convert `risk_5g_ord` balik ke integer untuk `lm`. Output `summary()` lengkap supaya bisa baca R², F-stat, dan koefisien individual.
+
+```{r ols}
+df_model$risk_5g <- as.integer(as.character(df_model$risk_5g_ord))
+
+f_ols <- make_formula(c(psn_items, cog_vars, demo_vars), outcome = "risk_5g")
+ols_full <- lm(f_ols, data = df_model)
+
+summary(ols_full)
+```
+
+## Standardized Betas
+
+Hitung std beta secara manual (`coef × sd_x / sd_y`) untuk semua prediktor, lalu sortir by absolute magnitude. Top prediktor di sini bisa dibandingkan langsung dengan top prediktor di baseline 4-group — kalau prediktor utamanya sama (misal: `educ_years` dan satu-dua trait BFI di top-5), hasil robust.
+
+```{r std_betas}
+ols_std <- broom::tidy(ols_full) %>%
+  filter(term != "(Intercept)") %>%
+  mutate(std_beta = estimate / sd(df_model$risk_5g) *
+           map_dbl(term, ~ sd(df_model[[.x]]))) %>%
+  dplyr::select(term, std_beta, std.error, statistic, p.value) %>%
+  arrange(desc(abs(std_beta)))
+
+head(ols_std, 12)
+```
+
+## Summary Comparison
+
+Ringkasan dua hal kunci untuk diff vs baseline: (1) urutan AIC antar spesifikasi, dan (2) top-5 prediktor. Ini yang akan dilaporkan di paragraf "robustness" di paper.
+
+```{r summary}
+cat("AIC ordering preserved?\n")
+aic_table %>% dplyr::select(model, delta_AIC)
+
+cat("\nTop 5 predictors:\n")
+head(ols_std, 5) %>% dplyr::select(term, std_beta, p.value)
+```
+
+## Save
+
+Simpan hasil ke `output/tables/robustness_5group.rds` — dipakai nanti di reporting dan comparison table dengan baseline.
+
+```{r save}
+robustness <- list(
+  aic_table   = aic_table,
+  full_ologit = ologit_fits$full,
+  full_ols    = ols_full,
+  ols_std     = ols_std,
+  risk_dist   = df %>% count(risk_5g) %>% mutate(pct = n / sum(n) * 100),
+  n_total     = nrow(df_model)
+)
+
+saveRDS(robustness, "output/tables/robustness_5group.rds")
+cat("Saved to output/tables/robustness_5group.rds\n")
+```

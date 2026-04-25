@@ -1,0 +1,223 @@
+---
+title: "04_feature_merge"
+output: html_document
+date: "2026-03-21"
+---
+
+# Feature Merge & Analytic Sample Construction
+
+Gabung tiga dataset processed (`risk_index`, `big_five`, `cognitive`) dengan demografi mentah (PTRACK, HTRACK, BK, DL, TK) jadi satu **analytic sample** untuk modeling. Output akhir: dataset usia 18–65 lengkap dengan target (risk preference) + semua prediktor (personality, cognitive, demographic, geographic).
+
+## Setup & Load Data
+
+Tiga sumber: (1) hasil olahan dari script 01–03, (2) tracking files (PTRACK = individu, HTRACK = household), dan (3) modul demografi (`b3a_dl1` untuk pendidikan, `b3a_tk1` untuk employment). Semuanya dipakai untuk membangun fitur kontrol.
+
+```{r setup}
+library(haven)
+library(tidyverse)
+
+# --- Previously processed ---
+risk   <- readRDS("../data/processed/risk_index.rds")
+bfi    <- readRDS("../data/processed/big_five.rds")
+cog    <- readRDS("../data/processed/cognitive.rds")
+
+# --- Raw demographic sources ---
+ptrack <- read_dta("../data/raw/ptrack.dta")
+htrack <- read_dta("../data/raw/htrack.dta")
+dl_raw <- read_dta("../data/raw/b3a_dl1.dta")  # education
+tk_raw <- read_dta("../data/raw/b3a_tk1.dta")  # employment
+
+names(ptrack) <- tolower(names(ptrack))
+names(htrack) <- tolower(names(htrack))
+names(dl_raw) <- tolower(names(dl_raw))
+names(tk_raw) <- tolower(names(tk_raw))
+```
+
+## Demografi dari PTRACK
+
+Ekstrak `age_14` (umur saat survei IFLS5/2014–15) dan `sex` (1=male, 3=female di kode IFLS). Bikin tiga fitur turunan: `age`, `age_sq` (untuk capture non-linearity dalam pengaruh umur — lifecycle effect), dan `female` sebagai binary indicator.
+
+```{r ptrack}
+demo <- ptrack |>
+  mutate(across(where(~ inherits(., "haven_labelled")), ~ as.numeric(as.character(.)))) |>
+  select(pidlink,
+         age = age_14,
+         sex
+  ) |>
+  filter(!is.na(age)) |>
+  mutate(
+    female = as.integer(sex == 3),
+    age_sq = age^2
+  ) |>
+  select(pidlink, age, age_sq, female)
+
+cat("PTRACK demo:", nrow(demo), "rows\n")
+demo |> summarise(across(-pidlink, list(mean = ~ mean(.x, na.rm = TRUE),
+                                         miss = ~ sum(is.na(.x)))))
+```
+
+## Geografis: Provinsi & Urban/Rural
+
+Province di-link via `hhid14_9` dari HTRACK; status urban/rural dari modul BK_SC1 (`sc05`: 1=urban, 2=rural → di-recode jadi `rural` binary). Dua-duanya ada di level rumah tangga, jadi terakhir di-merge balik ke level individu lewat mapping `pidlink ↔ hhid14_9` di PTRACK. Bentuk akhir: `geo_pid` dengan kolom `province` (factor) dan `rural`.
+
+```{r name}
+# --- Province from HTRACK ---
+geo_hh <- htrack |>
+  mutate(across(where(~ inherits(., "haven_labelled")), ~ as.numeric(as.character(.)))) |>
+  select(hhid14_9, province = sc01_14_14)
+
+# --- Urban/Rural from BK_SC1 ---
+bk_raw <- read_dta("../data/raw/bk_sc1.dta")
+names(bk_raw) <- tolower(names(bk_raw))
+
+urban_hh <- bk_raw |>
+  mutate(across(where(~ inherits(., "haven_labelled")), ~ as.numeric(as.character(.)))) |>
+  select(hhid14_9, urban = sc05) |>   # 1=urban, 2=rural
+  mutate(rural = as.integer(urban == 2)) |>
+  select(hhid14_9, rural)
+
+# --- Combine & link to PIDLINK ---
+geo <- geo_hh |>
+  left_join(urban_hh, by = "hhid14_9") |>
+  filter(!is.na(province)) |>
+  mutate(province = factor(province))
+
+pid_hh <- ptrack |>
+  select(pidlink, hhid14_9) |>
+  filter(!is.na(hhid14_9))
+
+geo_pid <- pid_hh |>
+  left_join(geo, by = "hhid14_9") |>
+  select(pidlink, province, rural)
+
+cat("Geo:", nrow(geo_pid), "rows\n")
+geo_pid |> count(rural)
+geo_pid |> count(province) |> print(n = 15)
+```
+
+## Education — Years of Schooling
+
+Konversi dari `dl06` (level pendidikan tertinggi) + `dl07` (kelas/tahun di level itu) jadi **years of schooling** kontinu. Mapping mengikuti struktur sistem pendidikan Indonesia:
+
+- SD/MI = 6 tahun, SMP/MTs = +3 (total 9), SMA/MA = +3 (total 12)
+- Diploma = +3 (total 15), S1 = +4 (total 16), S2 = +2 (total 18), S3 = +3 (total 21)
+- Pesantren (`14`) di-treat setara SD; adult education A/B/C (`11/12/13`) sesuai padanannya
+- Code DK/refuse (`98`/`99`) di `dl07` di-recode `NA` sebelum perhitungan
+
+Ada dua-pass: pertama pakai `dl07_clean` apa adanya (kalau belum lulus level), kedua override kalau `dl07 == 7` (graduated → tahun penuh level).
+
+```{r education}
+educ <- dl_raw |>
+  mutate(across(where(~ inherits(., "haven_labelled")), ~ as.numeric(as.character(.)))) |>
+  select(pidlink, dl06, dl07) |>
+  mutate(
+    # DL06 codes: 01=no school, 02=elementary, 03=junior high general,
+    # 04=junior high vocational, 05=senior high general, 06=senior high vocational,
+    # 60=college D1-D3, 61=bachelor, 62=master, 63=doctorate
+    # 11=adult ed A, 12=adult ed B, 13=adult ed C, 14=pesantren, 15=disabled school
+    # 72=islamic elementary, 73=islamic junior, 74=islamic senior
+
+    # DL07: highest grade at that level. 00=didn't finish 1st grade, 07=graduated, 98=DK
+    dl07_clean = if_else(dl07 %in% c(98, 99), NA_real_, dl07),
+
+    # Approximate years of schooling
+    educ_years = case_when(
+      dl06 == 1 | is.na(dl06)       ~ 0,                           # no school
+      dl06 %in% c(2, 11, 14, 72)    ~ pmin(dl07_clean, 6, na.rm = TRUE),  # elementary (max 6)
+      dl06 %in% c(3, 4, 12, 73)     ~ 6 + pmin(dl07_clean, 3, na.rm = TRUE),  # junior high
+      dl06 %in% c(5, 6, 13, 74)     ~ 9 + pmin(dl07_clean, 3, na.rm = TRUE),  # senior high
+      dl06 == 60                     ~ 12 + pmin(dl07_clean, 3, na.rm = TRUE), # diploma
+      dl06 %in% c(61)               ~ 12 + pmin(dl07_clean, 4, na.rm = TRUE), # bachelor
+      dl06 %in% c(62)               ~ 16 + pmin(dl07_clean, 2, na.rm = TRUE), # master
+      dl06 %in% c(63)               ~ 18 + pmin(dl07_clean, 3, na.rm = TRUE), # doctorate
+      TRUE                          ~ NA_real_
+    ),
+    # Graduated flag from DL07
+    educ_years = if_else(dl07 == 7 & dl06 %in% c(2, 72), 6, educ_years),
+    educ_years = if_else(dl07 == 7 & dl06 %in% c(3, 4, 73), 9, educ_years),
+    educ_years = if_else(dl07 == 7 & dl06 %in% c(5, 6, 74), 12, educ_years),
+    educ_years = if_else(dl07 == 7 & dl06 == 60, 15, educ_years),
+    educ_years = if_else(dl07 == 7 & dl06 == 61, 16, educ_years),
+    educ_years = if_else(dl07 == 7 & dl06 == 62, 18, educ_years),
+    educ_years = if_else(dl07 == 7 & dl06 == 63, 21, educ_years)
+  ) |>
+  select(pidlink, educ_years)
+
+educ |>
+  summarise(mean = mean(educ_years, na.rm = TRUE),
+            sd   = sd(educ_years, na.rm = TRUE),
+            miss = sum(is.na(educ_years)))
+```
+
+## Employment Status
+
+Dari `tk01` ("Apakah Anda bekerja minggu lalu?"): `1`=ya, `3`=tidak. Recode jadi `employed` binary. Sederhana, tapi cukup untuk baseline — variabel jam kerja & income di IFLS biasanya banyak missing dan butuh treatment terpisah.
+
+```{r employment}
+employ <- tk_raw |>
+  mutate(across(where(~ inherits(., "haven_labelled")), ~ as.numeric(as.character(.)))) |>
+  select(pidlink, tk01) |>   # TK01: did you work last week? 1=yes 3=no
+  mutate(
+    employed = as.integer(tk01 == 1)
+  ) |>
+  select(pidlink, employed)
+
+employ |> summarise(mean = mean(employed, na.rm = TRUE),
+                    miss = sum(is.na(employed)))
+```
+
+## Merge All Features
+
+`risk` sebagai anchor (filter ke yang `risk_s1` non-NA = lolos screening Set 1), lalu left-join 5 dataset prediktor. Setelah merge, hitung missingness per variabel — ini penting untuk evaluasi sample loss dan deteksi masalah merge (mismatch ID, dst.).
+
+```{r merge}
+analytic <- risk |>
+  filter(!is.na(risk_s1)) |>              # only eligible Set 1 respondents
+  left_join(bfi, by = "pidlink") |>
+  left_join(cog, by = "pidlink") |>
+  left_join(demo, by = "pidlink") |>
+  left_join(geo_pid, by = "pidlink") |>
+  left_join(educ, by = "pidlink") |>
+  left_join(employ, by = "pidlink")
+
+cat("Analytic sample:", nrow(analytic), "rows\n")
+
+# --- Missingness summary ---
+analytic |>
+  summarise(across(everything(), ~ sum(is.na(.x)))) |>
+  pivot_longer(everything(), names_to = "variable", values_to = "n_missing") |>
+  mutate(pct_missing = n_missing / nrow(analytic) * 100) |>
+  filter(n_missing > 0) |>
+  arrange(desc(pct_missing)) |>
+  print(n = Inf)
+```
+
+## Filter Age 18–65
+
+Restriksi sample ke usia kerja produktif 18–65. Alasannya: di bawah 18, kapasitas pengambilan keputusan finansial belum settled; di atas 65, banyak responden retired dengan pola risk preference yang berbeda secara struktural (life-cycle hypothesis). Filter ini memperketat interpretasi tapi mengurangi sample size.
+
+```{r age filter}
+analytic <- analytic |>
+  filter(age >= 18, age <= 65)
+
+cat("After age filter (18-65):", nrow(analytic), "rows\n")
+analytic |>
+  summarise(min_age = min(age), max_age = max(age),
+            mean_age = mean(age), n = n())
+```
+
+## Final Dataset
+
+Drop dua kolom yang tidak dipakai di baseline modeling: `math_score` (terlalu banyak missing karena cuma di EK1) dan `sem` (uncertainty dari W-score, hanya untuk QA). Save ke `data/processed/analytic_sample_18_65.rds` — input ke script `05_Baseline_Model.Rmd`. Print distribusi `risk_s1` final untuk cek balance kelas.
+
+```{r final dataset}
+analytic <- analytic |>
+  select(-math_score, -sem)
+
+analytic |> saveRDS("../data/processed/analytic_sample_18_65.rds")
+
+cat(sprintf("Final analytic sample: %d observations, %d variables\n",
+            nrow(analytic), ncol(analytic)))
+
+analytic |> count(risk_s1) |> mutate(pct = n / sum(n) * 100)
+```

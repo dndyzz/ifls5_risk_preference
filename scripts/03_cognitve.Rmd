@@ -1,0 +1,206 @@
+---
+title: "03_cognitive"
+output: html_document
+date: "2026-03-21"
+---
+
+# Cognitive Features Construction
+
+Gabungkan ukuran-ukuran kognitif dari beberapa modul IFLS5 jadi satu set fitur per responden:
+
+- **CO1** — *word recall* (immediate & delayed) + *serial 7s* (mental arithmetic) + self-rated memory
+- **COB** — *adaptive number series* (W-score, 300–650 range, mengikuti standar W-ability scaling)
+- **EK1/EK2** — *Raven's Progressive Matrices* + math literacy
+
+Output: dataset cognitive features per `pidlink` yang nantinya dipakai sebagai prediktor di baseline model.
+
+## Setup & Load Data
+
+Load 4 file mentah sekaligus. CO1 & COB ada di sub-modul B3B (administered ke responden dewasa), sementara EK1/EK2 adalah modul khusus eksperimen kognitif (lebih granular). Ukuran masing-masing tabel beda jauh — print row counts buat sanity check sebelum lanjut.
+
+```{r setup}
+library(haven)
+library(tidyverse)
+
+co1_raw <- read_dta("data/raw/b3b_co1.dta")
+cob_raw <- read_dta("data/raw/b3b_cob.dta")
+ek1_raw <- read_dta("data/raw/ek_ek1.dta")
+ek2_raw <- read_dta("data/raw/ek_ek2.dta")
+
+names(co1_raw) <- tolower(names(co1_raw))
+names(cob_raw) <- tolower(names(cob_raw))
+names(ek1_raw) <- tolower(names(ek1_raw))
+names(ek2_raw) <- tolower(names(ek2_raw))
+
+cat("CO1:", nrow(co1_raw), "rows\n")
+cat("COB:", nrow(cob_raw), "rows\n")
+cat("EK1:", nrow(ek1_raw), "rows\n")
+cat("EK2:", nrow(ek2_raw), "rows\n")
+```
+
+## Word Recall & Serial 7s
+
+Tiga ukuran dari modul CO1:
+
+- **Word recall** — `co07count` (immediate, langsung setelah list dibacakan) dan `co10count` (delayed, setelah ~5 menit). Selisih dua ini sering dipakai sebagai proxy *working memory decay*.
+- **Serial 7s** — kurangi 100 dengan 7 berulang. Jawaban benar = 93, 86, 79, 72, 65. Skor = jumlah benar (0–5). Kalau `co04a` NA → tidak menjawab sama sekali → set seluruh skor jadi NA (bukan 0, supaya tidak kesalahan klasifikasi).
+- **Self-rated memory** (`co04aa`) — di-reverse jadi `6 - x` supaya skor tinggi = persepsi memory baik (konsisten arah dengan ukuran objektif).
+
+```{r word-recall}
+co1 <- co1_raw |>
+  mutate(across(where(~ inherits(., "haven_labelled")), ~ as.numeric(as.character(.)))) |>
+  select(pidlink,
+         co04aa,                              # self-rated memory (1=excellent..5=poor)
+         co04a, co04b, co04c, co04d, co04e,   # serial 7s raw answers
+         co07count,                            # immediate word recall count
+         co10count                             # delayed word recall count
+  ) |>
+  mutate(
+    # --- Serial 7s: score number of correct subtractions (0-5) ---
+    s7_1 = as.integer(co04a == 93),
+    s7_2 = as.integer(co04b == 86),
+    s7_3 = as.integer(co04c == 79),
+    s7_4 = as.integer(co04d == 72),
+    s7_5 = as.integer(co04e == 65),
+    serial7_score = rowSums(pick(s7_1:s7_5), na.rm = TRUE),
+    # If co04a is NA, person didn't attempt → set score to NA
+    serial7_score = if_else(is.na(co04a), NA_real_, as.double(serial7_score)),
+
+    # Self-rated memory: reverse so higher = better
+    memory_self = 6 - co04aa
+  ) |>
+  select(pidlink, co07count, co10count, serial7_score, memory_self)
+
+co1 |>
+  summarise(across(-pidlink, list(
+    mean = ~ mean(.x, na.rm = TRUE),
+    miss = ~ sum(is.na(.x))
+  )))
+```
+
+## Number Series — Identifikasi Variabel W-Score
+
+COB module berisi *adaptive number series* dengan **W-score** (Rasch-scaled ability, range tipikal 300–650). Variabel-nya kadang dinamai `wscore`, `w_score`, `cobws`, atau `w_abil` tergantung versi data — print semua nama kolom dan filter kolom dengan mean > 200 (heuristik untuk W-score yang range-nya tinggi) untuk identifikasi.
+
+```{r COB}
+# Check what variables exist in COB
+names(cob_raw) |> sort()
+
+# W-score variable likely named wscore, w_score, cobws, or similar
+cob_raw |>
+  select(where(~ is.numeric(.) && mean(., na.rm = TRUE) > 200)) |>
+  summarise(across(everything(), ~ mean(.x, na.rm = TRUE)))
+# W-scores typically range 300-650 based on User Guide table
+```
+
+## Compute W-Score
+
+Setelah tau nama variabel yang benar (di IFLS5 = `w_abil`), select W-score dan SEM (standard error). SEM penting karena W-score dihitung *adaptively* — responden yang dapat soal lebih sedikit punya SEM lebih tinggi, jadi SEM bisa dipakai sebagai *quality flag* di analisis lanjutan kalau perlu.
+
+```{r w-score}
+cob <- cob_raw |>
+  mutate(across(where(~ inherits(., "haven_labelled")), ~ as.numeric(as.character(.)))) |>
+  select(pidlink,
+         wscore = w_abil,   # ← rename to standard name
+         sem                # standard error of W-score
+  )
+
+cob |>
+  summarise(
+    mean_w   = mean(wscore, na.rm = TRUE),
+    sd_w     = sd(wscore, na.rm = TRUE),
+    mean_sem = mean(sem, na.rm = TRUE),
+    n        = sum(!is.na(wscore))
+  )
+```
+
+## EK Module — Raven's & Math
+
+Modul EK punya dua versi: **EK1** (Raven's 12 item + Math 10 item) untuk subset responden tertentu, dan **EK2** (Raven's saja, 12 item) untuk subset lain. Strategi: skor masing-masing dengan `rowSums`, lalu **gabungkan dengan prefer EK1** kalau responden muncul di keduanya (EK1 lebih lengkap karena ada math). EK2 hanya kontribusi responden yang `pidlink`-nya tidak ada di EK1.
+
+```{r ek}
+raven_vars <- paste0("ek", 1:12, "_ans")
+math_vars  <- paste0("ek", 13:22, "_ans")
+
+# --- EK1: Raven's + Math ---
+ek1 <- ek1_raw |>
+  mutate(across(where(~ inherits(., "haven_labelled")), ~ as.numeric(as.character(.)))) |>
+  select(pidlink, any_of(c(raven_vars, math_vars))) |>
+  mutate(
+    raven_score = rowSums(pick(any_of(raven_vars)), na.rm = TRUE),
+    math_score  = rowSums(pick(any_of(math_vars)), na.rm = TRUE)
+  )
+
+# --- EK2: Raven's only ---
+ek2 <- ek2_raw |>
+  mutate(across(where(~ inherits(., "haven_labelled")), ~ as.numeric(as.character(.)))) |>
+  select(pidlink, any_of(raven_vars)) |>
+  mutate(
+    raven_score = rowSums(pick(any_of(raven_vars)), na.rm = TRUE)
+  )
+
+# --- Combine: prefer EK1 if person appears in both ---
+ek_combined <- bind_rows(
+  ek1 |> select(pidlink, raven_score, math_score),
+  ek2 |> select(pidlink, raven_score) |> filter(!pidlink %in% ek1$pidlink)
+)
+
+ek_combined |>
+  summarise(
+    n              = n(),
+    n_raven        = sum(!is.na(raven_score)),
+    n_math         = sum(!is.na(math_score)),
+    mean_raven     = mean(raven_score, na.rm = TRUE),
+    mean_math      = mean(math_score, na.rm = TRUE)
+  )
+```
+
+## Merge & Save
+
+Gabung semua ukuran cognitive ke satu dataset per `pidlink` via left join (CO1 sebagai anchor karena coverage paling luas). Print missingness per kolom — biasanya `wscore` & `raven_score` paling banyak missing karena modul EK/COB tidak diadminister ke semua responden. Save ke `data/processed/cognitive.rds`.
+
+```{r merge-save}
+cog_final <- co1 |>
+  left_join(cob, by = "pidlink") |>
+  left_join(ek_combined, by = "pidlink")
+
+cog_final |>
+  summarise(across(-pidlink, list(
+    mean = ~ mean(.x, na.rm = TRUE),
+    miss = ~ sum(is.na(.x)),
+    pct_miss = ~ mean(is.na(.x)) * 100
+  )))
+
+cog_final |> saveRDS("data/processed/cognitive.rds")
+
+cat("Cognitive features complete.\n")
+cat(sprintf("  N rows: %d\n", nrow(cog_final)))
+```
+
+## Quick EDA
+
+Dua diagnostik:
+
+1. **Correlation matrix** antar ukuran cognitive — diharapkan korelasi positif moderat antara word recall ↔ Raven's ↔ W-score (semua menangkap *general cognitive ability* alias *g-factor*). Kalau korelasi rendah/negatif, ada masalah scoring.
+2. **Histogram per ukuran** — cek bentuk distribusi. Word count tipikal binomial-ish (cap 0–10), Raven biasanya skew kiri (kalau mudah) atau bell-shape, serial 7s sering bimodal (banyak skor 0 dan 5).
+
+```{r EDA}
+# --- Correlation matrix of cognitive measures ---
+cog_final |>
+  select(-pidlink, -sem) |>
+  cor(use = "pairwise.complete.obs") |>
+  round(3)
+
+# --- Distributions ---
+cog_final |>
+  select(co07count, co10count, serial7_score, raven_score) |>
+  pivot_longer(everything()) |>
+  drop_na() |>
+  ggplot(aes(value)) +
+  geom_histogram(fill = "#2c7fb8", alpha = .8, bins = 15) +
+  facet_wrap(~ name, scales = "free", ncol = 4) +
+  labs(title = "Cognitive Measure Distributions (IFLS5)") +
+  theme_minimal(base_size = 11)
+
+ggsave("output/figures/cognitive_distributions.png", width = 14, height = 4, dpi = 150)
+```

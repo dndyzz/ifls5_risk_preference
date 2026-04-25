@@ -1,0 +1,258 @@
+---
+title: "01_risk_index_construction"
+output: html_document
+date: "2026-03-21"
+---
+
+# Risk Index Construction — Approach A: Screening-based 4-Group
+
+Konstruksi *risk preference index* dari modul **SI (Subjective Expectations / Risk)** IFLS5, mengikuti **Thamarapani & Rockmore (2022)**, IJDRR (Fig. A2 & A4). Output utamanya: variabel ordinal 1–4 (1 = paling risk averse, 4 = paling risk seeking) untuk dua *stake levels* (Set 1: Rp 800K, Set 2: Rp 4M).
+
+## Setup & Load Data
+
+Load modul `b3a_si.dta` (risk preference questions). Variabel inti ada 10: `si01`–`si05` (Set 1, low stakes) dan `si11`–`si15` (Set 2, high stakes). Kode `8` (DK) dan `9` (refuse) di-recode sebagai `NA` supaya tidak terbawa ke logika scoring. Pertahankan `random_si` untuk *order-effect check* di bagian diagnostics.
+
+```{r setup, include=FALSE}
+library(haven)
+library(tidyverse)
+
+si_raw <- read_dta("../data/raw/b3a_si.dta")
+names(si_raw) <- tolower(names(si_raw))
+
+si_vars <- c("si01","si02","si03","si04","si05",
+             "si11","si12","si13","si14","si15")
+
+si_clean <- si_raw |>
+  select(pidlink, hhid14, pid14, random_si, all_of(si_vars)) |>
+  mutate(across(all_of(si_vars), ~ if_else(.x %in% c(8, 9), NA_real_, .x)))
+```
+
+## Screening & Eligibility Flags
+
+Screening pertanyaan pertama (`si01`/`si11`) dipakai untuk filter responden yang **gamble averse** — yaitu yang menolak gamble *dominan* (pilihan yang secara matematis lebih baik). Logikanya:
+
+- **Set 1**: `si01` adalah dominance gamble di mana pilihan *risky* secara stokastik mendominasi yang *certain*. Kalau responden tetap pilih *certain* (`si01==1`) **dan** dikonfirmasi di `si02==1`, mereka di-flag sebagai `gamble_averse` dan **dieksklusi** dari scoring.
+- **Set 2**: `si11` polanya kebalik — *certain* yang dominan, jadi pilih *risky* (`si11==2`) yang dianggap "salah" dan butuh konfirmasi `si12`.
+
+Flag `eligible` mencakup yang lolos langsung maupun yang sempat salah tapi dikoreksi (`eligible_corrected`). Hasil counts dipakai sebagai sanity check — proporsi `gamble_averse` biasanya 20–30% di IFLS.
+
+```{r screening}
+si_screened <- si_clean |>
+  mutate(
+    # --- Set 1 screening ---
+    screen_s1 = case_when(
+      is.na(si01)                    ~ "missing",
+      si01 == 2                      ~ "eligible",
+      si01 == 1 & si02 == 2          ~ "eligible_corrected",
+      si01 == 1 & si02 == 1          ~ "gamble_averse",
+      si01 == 1 & is.na(si02)        ~ "missing",
+      TRUE                           ~ "missing"
+    ),
+    eligible_s1 = screen_s1 %in% c("eligible", "eligible_corrected"),
+
+    # --- Set 2 screening ---
+    screen_s2 = case_when(
+      is.na(si11)                    ~ "missing",
+      si11 == 1                      ~ "eligible",
+      si11 == 2 & si12 == 2          ~ "eligible_corrected",
+      si11 == 2 & si12 == 1          ~ "gamble_averse",
+      si11 == 2 & is.na(si12)        ~ "missing",
+      TRUE                           ~ "missing"
+    ),
+    eligible_s2 = screen_s2 %in% c("eligible", "eligible_corrected")
+  )
+
+# Screening summary
+si_screened |> count(screen_s1) |> mutate(pct = n / sum(n) * 100)
+si_screened |> count(screen_s2) |> mutate(pct = n / sum(n) * 100)
+```
+
+## Set 1 Scoring (Low Stakes — Rp 800K)
+
+Decision tree dari pertanyaan lanjutan `si03` → `si04`/`si05`. Setelah lolos screening, responden dirutekan ke salah satu dari **4 grup** berdasarkan kombinasi pilihan certain vs risky di dua titik. Skala dibuat **monoton naik dari risk averse ke risk seeking** (1 = paling averse, 4 = paling seeking) supaya konsisten dengan interpretasi ordinal. Hanya yang `eligible_s1 == TRUE` yang di-score; sisanya tetap `NA`.
+
+```{r set1-score}
+si_scored <- si_screened |>
+  mutate(
+    risk_s1 = case_when(
+      !eligible_s1                    ~ NA_integer_,
+      si03 == 1 & si04 == 1          ~ 1L,
+      si03 == 1 & si04 == 2          ~ 2L,
+      si03 == 2 & si05 == 1          ~ 3L,
+      si03 == 2 & si05 == 2          ~ 4L,
+      TRUE                           ~ NA_integer_
+    )
+  )
+
+si_scored |> filter(eligible_s1) |> count(risk_s1)
+```
+
+## Set 2 Scoring (High Stakes — Rp 4M)
+
+Logika identik dengan Set 1, tapi nominalnya jauh lebih besar dan **Set 2 mengandung *loss domain*** di `si15` (gamble dengan kemungkinan rugi Rp 2M). Artinya Group 4 di sini = responden yang berani ambil gamble kerugian — interpretasi behavioral-nya lebih kuat ke *loss tolerance* dibanding Set 1. Ini sebabnya Set 2 sering dipakai sebagai *robustness check* dibanding sebagai target utama.
+
+```{r set2-score}
+si_scored <- si_scored |>
+  mutate(
+    risk_s2 = case_when(
+      !eligible_s2                    ~ NA_integer_,
+      si13 == 1 & si14 == 1          ~ 1L,
+      si13 == 1 & si14 == 2          ~ 2L,
+      si13 == 2 & si15 == 1          ~ 3L,
+      si13 == 2 & si15 == 2          ~ 4L,
+      TRUE                           ~ NA_integer_
+    )
+  )
+
+si_scored |> filter(eligible_s2) |> count(risk_s2)
+```
+
+## Binary Risk-Averse Indicator
+
+Versi *binary* dari index ordinal — collapse Group 1+2 jadi `risk_averse = 1`, Group 3+4 jadi `0`. Berguna untuk analisis dengan logit standar atau perbandingan replikasi langsung dengan Thamarapani & Rockmore (2022) yang melaporkan proporsi risk averse populasi. **Catatan**: bentuk ini membuang variasi dalam grup, jadi dipakai hanya untuk reporting/replikasi — versi ordinal tetap target utama modeling.
+
+```{r binary}
+si_scored <- si_scored |>
+  mutate(
+    risk_averse_s1 = case_when(
+      risk_s1 %in% c(1L, 2L) ~ 1L,
+      risk_s1 %in% c(3L, 4L) ~ 0L,
+      TRUE                   ~ NA_integer_
+    ),
+    risk_averse_s2 = case_when(
+      risk_s2 %in% c(1L, 2L) ~ 1L,
+      risk_s2 %in% c(3L, 4L) ~ 0L,
+      TRUE                   ~ NA_integer_
+    )
+  )
+
+# Quick proportions
+si_scored |>
+  summarise(
+    pct_averse_s1 = mean(risk_averse_s1, na.rm = TRUE),
+    pct_averse_s2 = mean(risk_averse_s2, na.rm = TRUE),
+    n_s1 = sum(!is.na(risk_averse_s1)),
+    n_s2 = sum(!is.na(risk_averse_s2))
+  )
+```
+
+## Diagnostics
+
+Empat cek validitas index:
+
+1. **Sample retention** — berapa banyak responden yang lolos di setiap tahap, plus proporsi gamble averse yang dieksklusi.
+2. **Cross-set agreement** — korelasi Pearson/Spearman antara `risk_s1` dan `risk_s2`. Korelasi rendah (~0.2–0.3) wajar di IFLS karena *stakes* dan *loss domain* berbeda; tapi terlalu rendah (~0) mengindikasikan masalah desain instrumen.
+3. **Cross-tabulation** — distribusi joint Group Set 1 × Set 2, untuk lihat di mana inkonsistensi terkonsentrasi.
+4. **Order effect** — apakah responden yang dapat Set 1 duluan (`random_si`) memberi jawaban berbeda dibanding yang dapat Set 2 duluan. Kalau beda jauh → ada *priming/anchoring effect* yang perlu dilaporkan sebagai limitation.
+
+```{r diagnostic}
+# --- Sample retention ---
+si_scored |>
+  summarise(
+    n_total       = n(),
+    n_eligible_s1 = sum(eligible_s1),
+    n_eligible_s2 = sum(eligible_s2),
+    n_scored_s1   = sum(!is.na(risk_s1)),
+    n_scored_s2   = sum(!is.na(risk_s2)),
+    n_both_scored = sum(!is.na(risk_s1) & !is.na(risk_s2)),
+    pct_gamble_averse_s1 = mean(screen_s1 == "gamble_averse") * 100,
+    pct_gamble_averse_s2 = mean(screen_s2 == "gamble_averse") * 100
+  )
+
+# --- Cross-set correlation (among eligible in both) ---
+si_scored |>
+  filter(!is.na(risk_s1) & !is.na(risk_s2)) |>
+  summarise(
+    r_pearson  = cor(risk_s1, risk_s2),
+    r_spearman = cor(risk_s1, risk_s2, method = "spearman"),
+    kappa      = sum(risk_s1 == risk_s2) / n(),  # simple agreement
+    n          = n()
+  )
+
+# --- Cross-tab ---
+si_scored |>
+  filter(!is.na(risk_s1) & !is.na(risk_s2)) |>
+  count(risk_s1, risk_s2) |>
+  pivot_wider(names_from = risk_s2, values_from = n,
+              names_prefix = "s2_", values_fill = 0)
+
+# --- Order effect ---
+si_scored |>
+  group_by(random_si) |>
+  summarise(
+    mean_s1 = mean(risk_s1, na.rm = TRUE),
+    mean_s2 = mean(risk_s2, na.rm = TRUE),
+    n_s1    = sum(!is.na(risk_s1)),
+    n_s2    = sum(!is.na(risk_s2))
+  )
+
+# --- Gamble aversion predictors (optional, replicates Table A1) ---
+si_scored |>
+  mutate(is_gamble_averse = screen_s1 == "gamble_averse") |>
+  summarise(
+    pct_total   = mean(is_gamble_averse, na.rm = TRUE) * 100
+  )
+```
+
+## Final Risk Index Dataset
+
+Simpan dataset final ke `data/processed/risk_index.rds` — berisi ID responden, flag screening, dan kedua versi index (ordinal & binary, Set 1 & Set 2). Untuk modeling utama: pakai **`risk_s1` sebagai target ordinal** (mengikuti T&R yang fokus di Set 1), dan `risk_s2` di-reserve untuk *robustness check*. File ini jadi input untuk script `04_merge_feature.Rmd`.
+
+```{r final-dataset}
+si_final <- si_scored |>
+  select(pidlink, hhid14, pid14, random_si,
+         screen_s1, screen_s2, eligible_s1, eligible_s2,
+         risk_s1, risk_s2, risk_averse_s1, risk_averse_s2)
+
+si_final |> saveRDS("../data/processed/risk_index.rds")
+
+cat("Approach A risk index complete.\n")
+cat(sprintf("  Set 1: %d scored / %d total (%.1f%% gamble averse excluded)\n",
+            sum(!is.na(si_final$risk_s1)), nrow(si_final),
+            mean(si_final$screen_s1 == "gamble_averse", na.rm = TRUE) * 100))
+cat(sprintf("  Set 2: %d scored / %d total (%.1f%% gamble averse excluded)\n",
+            sum(!is.na(si_final$risk_s2)), nrow(si_final),
+            mean(si_final$screen_s2 == "gamble_averse", na.rm = TRUE) * 100))
+```
+
+## EDA Plots
+
+Tiga panel diagnostic visual:
+
+- **p1, p2** — distribusi 4 grup di Set 1 dan Set 2. Bentuk yang biasa muncul di IFLS: skew ke kiri (mayoritas responden risk averse, Group 1–2 dominan), terutama di Set 2 high-stakes.
+- **p3** — breakdown screening outcome Set 1, untuk visualisasi seberapa besar slice `gamble_averse` yang dieksklusi.
+
+Output di-save ke `../output/figures/risk_index_approach_a.png` untuk dipakai di reporting.
+
+```{r plot}
+library(patchwork)
+
+p1 <- si_final |>
+  filter(!is.na(risk_s1)) |>
+  ggplot(aes(factor(risk_s1))) +
+  geom_bar(fill = "#2c7fb8", alpha = .8) +
+  labs(title = "Set 1 (Rp 800K) — 4 Groups",
+       subtitle = "After screening exclusion",
+       x = "Risk group (1=most averse, 4=least)", y = "n") +
+  theme_minimal(base_size = 11)
+
+p2 <- si_final |>
+  filter(!is.na(risk_s2)) |>
+  ggplot(aes(factor(risk_s2))) +
+  geom_bar(fill = "#d95f02", alpha = .8) +
+  labs(title = "Set 2 (Rp 4M) — 4 Groups",
+       subtitle = "After screening exclusion",
+       x = "Risk group (1=most averse, 4=least)", y = "n") +
+  theme_minimal(base_size = 11)
+
+p3 <- si_final |>
+  ggplot(aes(factor(screen_s1))) +
+  geom_bar(fill = "#7570b3", alpha = .8) +
+  labs(title = "Set 1 Screening Outcome",
+       x = NULL, y = "n") +
+  theme_minimal(base_size = 11) +
+  theme(axis.text.x = element_text(angle = 30, hjust = 1))
+
+p1 + p2 + p3 + plot_layout(ncol = 3)
+ggsave("../output/figures/risk_index_approach_a.png", width = 14, height = 4.5, dpi = 150)
+```

@@ -1,0 +1,198 @@
+---
+title: "02_big_five"
+output: html_document
+date: "2026-03-21"
+---
+
+# Big Five Personality Scoring — BFI-15 dari Modul PSN
+
+Konstruksi skor lima trait kepribadian (**Extraversion, Agreeableness, Conscientiousness, Neuroticism, Openness**) dari modul PSN IFLS5, mengikuti instrumen **BFI-15 (Gerlitz & Schupp, 2005)** yang aslinya dipakai di GSOEP. Output: skor trait kontinu (mean 1–5) per responden + 15 item mentah, untuk fleksibilitas modeling (bisa pakai trait composite atau item level).
+
+## Setup & Load Data
+
+Load `b3b_psn.dta`. Format aslinya **long** — satu baris per kombinasi (responden × item), jadi total ~471K baris untuk ~31K responden × 15 item. Sebelum lanjut, verifikasi: jumlah responden unik, label `psntype` (kode item 1–15), dan distribusi `psn01` (jawaban skala 1–5).
+
+```{r setup}
+library(haven)
+library(tidyverse)
+library(psych)   # for alpha()
+
+psn_raw <- read_dta("data/raw/b3b_psn.dta")
+names(psn_raw) <- tolower(names(psn_raw))
+
+# Inspect structure — should be long format
+nrow(psn_raw)       # expect ~471K
+n_distinct(psn_raw$pidlink)  # expect ~31K
+
+# Check PSNTYPE labels
+psn_raw |> count(psntype) |> print(n = 15)
+
+# Check PSN01 distribution
+psn_raw |> count(psn01)
+```
+
+## Pivot Long → Wide
+
+Reshape dari long ke wide: 1 baris per responden, 15 kolom item (`psn_01`–`psn_15`). Setelah pivot, nama kolom bisa berupa string angka `"1"`–`"15"` (kalau `psntype` numeric) atau label teks (kalau `haven_labelled`). Branch `if ("1" %in% psn_cols)` handle case numeric; mapping label ada di-comment sebagai backup. Cek terakhir: tidak ada duplikat `pidlink` dan kolom item-nya komplit.
+
+```{r pivot-wide}
+psn_wide <- psn_raw |>
+  select(pidlink, psntype, psn01) |>
+  pivot_wider(names_from = psntype, values_from = psn01) |>
+  mutate(across(where(~ inherits(., "haven_labelled")), ~ as.numeric(as.character(.))))
+
+nrow(psn_wide)
+names(psn_wide)
+
+# Rename numeric columns to consistent psn_XX format
+psn_cols <- setdiff(names(psn_wide), "pidlink")
+cat("Column names after pivot:\n")
+print(psn_cols)
+
+if ("1" %in% psn_cols) {
+  rename_map <- setNames(as.character(1:15), sprintf("psn_%02d", 1:15))
+  psn_wide <- psn_wide |> rename(!!!rename_map)
+}
+
+# If columns are label strings (e.g. "Is talkative."), map manually:
+# label_to_num <- c(
+#   "Is talkative." = "psn_01",
+#   "Does a thorough job." = "psn_02",
+#   "Is original, comes up with new ideas." = "psn_03",
+#   "Is reserved." = "psn_04",
+#   "Is relaxed, handles stress well." = "psn_05",
+#   "Has a forgiving nature." = "psn_06",
+#   "Worries a lot." = "psn_07",
+#   "Has an active imagination." = "psn_08",
+#   "Tends to be lazy." = "psn_09",
+#   "Values artistic, aesthetic experience" = "psn_10",
+#   "Is considerate and kind to almost   e" = "psn_11",
+#   "Does things efficiently." = "psn_12",
+#   "Outgoing, sociable." = "psn_13",
+#   "Is sometimes rude to others." = "psn_14",
+#   "Gets nervous easily." = "psn_15"
+# )
+# psn_wide <- psn_wide |> rename(!!!label_to_num)
+
+names(psn_wide)
+nrow(psn_wide)  # expect ~31,446
+
+# Quick check: duplicates & missingness
+psn_wide |> count(pidlink, sort = TRUE) |> filter(n > 1)
+psn_wide |> summarise(across(starts_with("psn_"), ~ sum(is.na(.x))))
+```
+
+## Item-to-Trait Mapping & Scoring
+
+Mapping item → trait mengikuti BFI-15 standar:
+
+- **Extraversion**: 1 (talkative), 4R (reserved), 13 (outgoing)
+- **Agreeableness**: 6 (forgiving), 11 (kind), 14R (rude)
+- **Conscientiousness**: 2 (thorough), 9R (lazy), 12 (efficient)
+- **Neuroticism**: 5R (relaxed), 7 (worries), 15 (nervous)
+- **Openness**: 3 (original), 8 (imagination), 10 (artistic)
+
+Item dengan suffix **R** = reverse-coded (4, 5, 9, 14) — direcode jadi `6 - x` supaya semua item mengarah ke kutub trait yang sama. Setelah itu, skor trait = mean 3 item terkait. **`na.rm = FALSE`** dipakai sengaja — dengan hanya 3 item per trait, imputasi dari 1–2 item terlalu noisy, jadi lebih baik return `NA` kalau ada item yang missing.
+
+```{r item-trait map}
+psn_scored <- psn_wide |>
+  mutate(
+    # Reverse code
+    psn_04r = 6 - psn_04,
+    psn_05r = 6 - psn_05,
+    psn_09r = 6 - psn_09,
+    psn_14r = 6 - psn_14,
+
+    # Trait scores (mean of 3 items each)
+    extraversion      = rowMeans(pick(psn_01, psn_04r, psn_13), na.rm = FALSE),
+    agreeableness     = rowMeans(pick(psn_06, psn_11, psn_14r), na.rm = FALSE),
+    conscientiousness = rowMeans(pick(psn_02, psn_09r, psn_12), na.rm = FALSE),
+    neuroticism       = rowMeans(pick(psn_05r, psn_07, psn_15), na.rm = FALSE),
+    openness          = rowMeans(pick(psn_03, psn_08, psn_10), na.rm = FALSE)
+  )
+
+psn_scored |>
+  summarise(across(c(extraversion:openness),
+                   list(mean = ~ mean(.x, na.rm = TRUE),
+                        sd   = ~ sd(.x, na.rm = TRUE),
+                        miss = ~ sum(is.na(.x)))))
+```
+
+## Reliability Check (Cronbach's α)
+
+Hitung Cronbach's α per trait sebagai cek konsistensi internal. Dengan hanya 3 item per skala, α tipikal di kisaran **.5–.6** untuk BFI-15 — terutama di konteks LMIC dengan penerjemahan/budaya yang beda. Ini **bukan masalah fatal**: kalau α rendah, opsinya pakai item level (15 fitur) langsung di model ML alih-alih trait composite. Hasil α perlu dilaporkan transparan sebagai limitation.
+
+```{r reliability}
+trait_items <- list(
+  extraversion      = c("psn_01", "psn_04r", "psn_13"),
+  agreeableness     = c("psn_06", "psn_11", "psn_14r"),
+  conscientiousness = c("psn_02", "psn_09r", "psn_12"),
+  neuroticism       = c("psn_05r", "psn_07", "psn_15"),
+  openness          = c("psn_03", "psn_08", "psn_10")
+)
+
+alpha_results <- map_dfr(trait_items, function(items) {
+  mat <- psn_scored |> select(all_of(items)) |> drop_na()
+  a <- psych::alpha(mat, check.keys = FALSE)
+  tibble(
+    alpha_raw  = a$total$raw_alpha,
+    alpha_std  = a$total$std.alpha,
+    n_complete = nrow(mat)
+  )
+}, .id = "trait")
+
+print(alpha_results)
+```
+
+## Intercorrelation & Distribution Plot
+
+Dua diagnostik tambahan:
+
+1. **Intercorrelation matrix** antar 5 trait — Big Five idealnya orthogonal, tapi di praktik biasanya muncul korelasi negatif antara *neuroticism* vs *extraversion/conscientiousness*. Kalau korelasi terlalu tinggi (>.5), ada sinyal item-trait mapping yang terkontaminasi.
+2. **Histogram per trait** — cek bentuk distribusi (skew, ceiling/floor effect). BFI-15 di IFLS biasanya skew agreeableness ke kanan (skor tinggi dominan, *social desirability bias*).
+
+Plot di-save ke `output/figures/big_five_distributions.png`.
+
+```{r EDA}
+# --- Trait intercorrelations ---
+traits <- c("extraversion", "agreeableness", "conscientiousness",
+            "neuroticism", "openness")
+
+psn_scored |>
+  select(all_of(traits)) |>
+  cor(use = "pairwise.complete.obs") |>
+  round(3)
+
+# --- Distribution plots ---
+psn_scored |>
+  select(pidlink, all_of(traits)) |>
+  pivot_longer(-pidlink, names_to = "trait", values_to = "score") |>
+  drop_na() |>
+  ggplot(aes(score, fill = trait)) +
+  geom_histogram(binwidth = 0.33, alpha = .7, show.legend = FALSE) +
+  facet_wrap(~ trait, scales = "free_y", ncol = 5) +
+  scale_x_continuous(breaks = 1:5) +
+  labs(title = "BFI-15 Trait Score Distributions (IFLS5)",
+       x = "Score (1-5)", y = "n") +
+  theme_minimal(base_size = 11)
+
+ggsave("output/figures/big_five_distributions.png", width = 14, height = 4, dpi = 150)
+```
+
+## Save Final Dataset
+
+Simpan ke `data/processed/big_five.rds`. **Yang disimpan: 15 item mentah (incl. reverse-coded) + 5 trait composite** — bukan salah satunya saja. Alasannya: untuk modeling baseline kita pakai trait composite (interpretable), tapi untuk tuning model ML lanjutan bisa eksplor item level (15 fitur granular). Simpan keduanya menghemat waktu re-load nanti.
+
+```{r score save}
+psn_final <- psn_scored |>
+  select(pidlink,
+         starts_with("psn_"),   # original + reverse coded items
+         all_of(traits))
+
+psn_final |> saveRDS("data/processed/big_five.rds")
+
+cat("Big Five scoring complete.\n")
+cat(sprintf("  N with complete trait scores: %d / %d\n",
+            sum(complete.cases(psn_final |> select(all_of(traits)))),
+            nrow(psn_final)))
+```

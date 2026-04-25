@@ -1,0 +1,515 @@
+---
+title: "05_feature_engin_baseline"
+output: html_document
+date: "2026-03-21"
+---
+
+# Baseline Model — Ordered Logit untuk Risk Preference
+
+Estimasi baseline model untuk memprediksi `risk_s1` (4-group risk preference, ordinal) dari Big Five + cognitive + demografi. Pakai **ordered logit (`polr`)** sebagai model utama (target ordinal), plus **OLS** sebagai *robustness check* untuk dapat R² interpretable. Tujuan: identifikasi prediktor mana yang berkontribusi signifikan dan bandingkan trade-off item-level vs trait-composite.
+
+## Setup
+
+Library yang dipakai: `MASS::polr` untuk ordered logit, `broom::tidy` untuk extract coefficient table, `marginaleffects` untuk *average marginal effects* (AME) yang interpretable di skala probabilitas, `psych` untuk descriptives. Override `select` ke `dplyr::select` karena `MASS` punya fungsi `select` yang nge-mask.
+
+```{r setup}
+library(tidyverse)
+library(MASS)        # polr() for ordered logit
+library(broom)       # tidy model output
+library(marginaleffects)  # marginal effects
+library(psych)
+select <- dplyr::select
+```
+
+## Load & Prep Feature Sets
+
+Load analytic sample (umur 18–65) dan **definisikan grup variabel**:
+
+- `psn_use` — 15 item BFI dengan reverse-coded versions (psn_04r/05r/09r/14r) menggantikan original-nya
+- `traits` — 5 trait composite (alternatif modeling)
+- `cog_vars` — 6 ukuran cognitive
+- `demo_vars` — 6 kontrol demografi (age, age_sq, female, educ_years, rural, employed)
+
+Pemisahan ini bikin formula model bisa di-construct fleksibel: demo-only, +PSN items, +cog, full, atau trait-composite.
+
+```{r load-prep}
+df <- readRDS("../data/processed/analytic_sample_18_65.rds")
+
+cat("Full sample:", nrow(df), "\n")
+cat("risk_s1 non-NA:", sum(!is.na(df$risk_s1)), "\n")
+
+# Feature sets
+id_vars    <- c("pidlink", "hhid14", "pid14")
+target     <- "risk_s1"
+
+psn_items  <- paste0("psn_", sprintf("%02d", 1:15))
+psn_rev    <- c("psn_04r", "psn_05r", "psn_09r", "psn_14r")
+psn_use    <- setdiff(psn_items, c("psn_04", "psn_05", "psn_09", "psn_14"))
+psn_use    <- c(psn_use, psn_rev)
+
+traits     <- c("openness", "conscientiousness", "extraversion",
+                 "agreeableness", "neuroticism")
+
+cog_vars   <- c("co07count", "co10count", "serial7_score", "memory_self",
+                 "wscore", "raven_score")
+
+demo_vars  <- c("age", "age_sq", "female", "educ_years", "rural", "employed")
+```
+
+## Analytic Subset (Complete Cases)
+
+Filter ke complete cases di semua variabel modeling. **Listwise deletion** dipilih supaya semua model fit di sample yang sama → comparison AIC/BIC valid antar model. Trade-off: kehilangan responden yang missing di salah satu fitur. Bandingkan `nrow(df)` vs `nrow(df_model)` untuk lihat *effective sample size loss*. Buat juga versi `risk_ord` sebagai factor ordinal untuk `polr`.
+
+```{r subset}
+model_vars <- c(target, psn_use, cog_vars, demo_vars)
+
+df_model <- df %>%
+  filter(!is.na(risk_s1)) %>%
+  dplyr::select(all_of(c(id_vars, model_vars, traits)),
+                any_of(c("province", "risk_s2", "risk_averse_s1", "risk_averse_s2",
+                          "screen_s1", "screen_s2", "random_si"))) %>%
+  drop_na(all_of(model_vars))
+
+df_model <- df_model %>%
+  mutate(risk_ord = factor(risk_s1, ordered = TRUE))
+
+cat("\nComplete cases for modeling:", nrow(df_model), "\n")
+cat("Dropped:", sum(!is.na(df$risk_s1)) - nrow(df_model), "\n\n")
+```
+
+## Descriptive Statistics — Sample Characteristics
+
+Tabel deskriptif untuk Tabel 1 paper. **Panel A (continuous)** pakai `psych::describe` untuk dapat mean/SD/median/skew/kurtosis sekaligus. **Panel B (categorical)** breakdown sex, urban/rural, employment, dan provinsi. Tujuan: pembaca bisa lihat profil sample (umur rata-rata, % perempuan, rata-rata tahun pendidikan, dst.) untuk menilai generalisability hasil.
+
+```{r desc-stat}
+# Continuous variables
+cont_vars <- c("age", "educ_years", traits, cog_vars)
+cont_labels <- c("Age (years)", "Education (years)",
+                 "Openness", "Conscientiousness", "Extraversion",
+                 "Agreeableness", "Neuroticism",
+                 "Word count (immediate)", "Word count (delayed)",
+                 "Serial 7 score", "Self-rated memory",
+                 "Adaptive number series (W-score)", "Raven's matrices")
+
+table1_cont <- df_model %>%
+  select(all_of(cont_vars)) %>%
+  describe() %>%
+  as_tibble(rownames = "variable") %>%
+  select(variable, n, mean, sd, median, min, max, skew, kurtosis) %>%
+  mutate(label = cont_labels, .before = variable)
+
+cat("Panel A: Continuous variables\n")
+print(table1_cont, n = Inf, width = Inf)
+
+# Categorical / binary variables
+cat("\nPanel B: Categorical variables\n")
+
+cat("\nSex:\n")
+df_model %>% count(female) %>%
+  mutate(pct = n / sum(n) * 100,
+         label = ifelse(female == 1, "Female", "Male")) %>%
+  select(label, n, pct) %>% print()
+
+cat("\nResidence:\n")
+df_model %>% count(rural) %>%
+  mutate(pct = n / sum(n) * 100,
+         label = ifelse(rural == 1, "Rural", "Urban")) %>%
+  select(label, n, pct) %>% print()
+
+cat("\nEmployment:\n")
+df_model %>% count(employed) %>%
+  mutate(pct = n / sum(n) * 100,
+         label = ifelse(employed == 1, "Employed", "Not employed")) %>%
+  select(label, n, pct) %>% print()
+
+cat("\nProvince:\n")
+df_model %>% count(province, sort = TRUE) %>%
+  mutate(pct = n / sum(n) * 100) %>% print(n = Inf)
+
+```
+
+## Risk Preference Distribution
+
+Distribusi target — Set 1 (low stakes) sebagai primary, Set 2 (high stakes) sebagai konteks. Tipikalnya **Group 1–2 dominan (>60% sample)** karena populasi LMIC cenderung risk averse. Plus tampilkan rate `gamble_averse` di full sample (sebelum eksklusi) dan check randomization order — kalau distribusi `risk_s1` beda jauh berdasarkan `random_si`, ada *order effect* yang perlu di-flag.
+
+```{r risk-pref}
+cat("Set 1 (low stakes, Rp 800K):\n")
+df_model %>% count(risk_s1) %>%
+  mutate(pct = n / sum(n) * 100,
+         cum_pct = cumsum(pct),
+         label = case_when(
+           risk_s1 == 1 ~ "1: Most risk averse",
+           risk_s1 == 2 ~ "2: Risk averse",
+           risk_s1 == 3 ~ "3: Risk neutral",
+           risk_s1 == 4 ~ "4: Risk seeking"
+         )) %>%
+  select(label, n, pct, cum_pct) %>% print()
+
+# Set 2 if available
+if ("risk_s2" %in% names(df_model)) {
+  cat("\nSet 2 (high stakes, Rp 4M):\n")
+  df_model %>%
+    filter(!is.na(risk_s2)) %>%
+    count(risk_s2) %>%
+    mutate(pct = n / sum(n) * 100,
+           cum_pct = cumsum(pct)) %>% print()
+}
+
+# Gamble averse rates (pre-exclusion, full df)
+cat("\nGamble averse rates (full eligible sample, pre-exclusion):\n")
+df %>%
+  summarise(
+    n_screen_s1    = sum(!is.na(screen_s1)),
+    ga_s1          = sum(risk_averse_s1 == 1, na.rm = TRUE),
+    ga_s1_pct      = ga_s1 / n_screen_s1 * 100,
+    n_screen_s2    = sum(!is.na(screen_s2)),
+    ga_s2          = sum(risk_averse_s2 == 1, na.rm = TRUE),
+    ga_s2_pct      = ga_s2 / n_screen_s2 * 100
+  ) %>% print(width = Inf)
+
+# Randomization order check
+cat("\nRandomization (which set asked first):\n")
+df_model %>% count(random_si) %>%
+  mutate(pct = n / sum(n) * 100) %>% print()
+
+```
+
+## Descriptive by Risk Preference
+
+Cross-tab mean/SD per kelompok `risk_s1`. Pertanyaan inti: **apakah profil demografi & kognitif beda secara sistematis antar kelompok risk preference?** Misal: Group 4 (risk seeking) tipikalnya lebih muda, lebih banyak laki-laki, lebih tinggi educ_years. Tabel ini jadi "preview" hasil regresi — kalau perbedaan terlihat di level descriptive, biasanya akan signifikan di model.
+
+```{r desc-by-pref}
+by_risk <- df_model %>%
+  group_by(risk_s1) %>%
+  summarise(
+    n          = n(),
+    age_m      = mean(age),
+    age_sd     = sd(age),
+    female_pct = mean(female) * 100,
+    educ_m     = mean(educ_years),
+    educ_sd    = sd(educ_years),
+    rural_pct  = mean(rural) * 100,
+    employed_pct = mean(employed) * 100,
+    # Traits
+    across(all_of(traits), list(m = mean, sd = sd), .names = "{.col}_{.fn}"),
+    # Cognitive
+    raven_m    = mean(raven_score),
+    raven_sd   = sd(raven_score),
+    wscore_m   = mean(wscore),
+    wscore_sd  = sd(wscore),
+    serial7_m  = mean(serial7_score),
+    serial7_sd = sd(serial7_score),
+    .groups = "drop"
+  )
+
+print(by_risk, width = Inf)
+
+```
+
+## Bivariate Test — Kruskal-Wallis
+
+Uji formal apakah perbedaan mean per grup signifikan. Pakai **Kruskal-Wallis** (non-parametric ANOVA) karena (1) distribusi banyak fitur tidak normal dan (2) target ordinal — KW lebih appropriate dibanding ANOVA klasik. P-value rendah = ada perbedaan distribusi antar grup → variabel kandidat prediktor.
+
+```{r anova}
+# Quick ANOVA / Kruskal-Wallis for each variable
+cat("\nGroup differences (Kruskal-Wallis p-values):\n")
+test_vars <- c("age", "educ_years", traits, "raven_score", "wscore", "serial7_score")
+kw_results <- map_dfr(test_vars, function(v) {
+  kw <- kruskal.test(reformulate("risk_s1", v), data = df_model)
+  tibble(variable = v, chi_sq = kw$statistic, df = kw$parameter, p_value = kw$p.value)
+})
+print(kw_results, n = Inf)
+```
+
+## Chi-Square Test (Categorical)
+
+Untuk variabel binary (sex, rural, employed): uji asosiasi dengan `risk_s1` via chi-square test of independence. Komplemen dari Kruskal-Wallis di atas — kalau signifikan, ada hubungan antara kategori dan distribusi risk preference (misal: laki-laki cenderung lebih risk seeking).
+
+```{r chi}
+cat("\nChi-square tests (categorical):\n")
+for (v in c("female", "rural", "employed")) {
+  ct <- chisq.test(table(df_model[[v]], df_model$risk_s1))
+  cat(sprintf("  %s: χ²=%.2f, df=%d, p=%.4f\n", v, ct$statistic, ct$parameter, ct$p.value))
+}
+```
+
+## Correlation Matrix
+
+Spearman correlation (non-parametric, robust ke outlier dan cocok untuk ordinal target) antara `risk_s1`, 5 trait, ukuran kognitif, age, dan educ_years. Pakai `psych::corr.test` dengan koreksi Holm untuk multiple comparison. Output: matriks korelasi + matriks p-value yang sudah di-adjust.
+
+```{r corr}
+
+cor_vars <- c("risk_s1", traits, "raven_score", "wscore", "serial7_score",
+              "age", "educ_years")
+
+cor_mat <- df_model %>%
+  select(all_of(cor_vars)) %>%
+  corr.test(method = "spearman", adjust = "holm")
+
+cat("Spearman correlations (lower triangle):\n")
+print(round(cor_mat$r, 3))
+cat("\np-values:\n")
+print(round(cor_mat$p, 4))
+
+```
+
+## Big Five Item-Level Descriptives
+
+Cek distribusi 15 item BFI individual (mean, SD, skew). Tujuan: deteksi item bermasalah — misal skor mean ekstrem (>4.5 atau <1.5) = ceiling/floor effect, atau skew tinggi = response bias. Item bermasalah bisa dipertimbangkan untuk drop di model akhir.
+
+```{r big5-desc}
+psn_desc <- df_model %>%
+  select(all_of(psn_use)) %>%
+  describe() %>%
+  as_tibble(rownames = "item") %>%
+  select(item, n, mean, sd, median, min, max, skew)
+
+print(psn_desc, n = Inf)
+```
+
+## Missingness Report & Complete-vs-Dropped Comparison
+
+Dua diagnostik untuk transparansi sample selection:
+
+1. **Missingness per variabel** — tunjukkan variabel mana yang paling banyak hilang. Kalau ada variabel >30% missing, perlu pertimbangkan drop atau imputasi.
+2. **Compare complete vs dropped** — apakah responden yang ke-drop systematically beda dari yang masuk model (umur, pendidikan, urban/rural)? Kalau iya, ada **selection bias** dan hasil model tidak generalize ke full sample.
+
+```{r missing-rep}
+miss_report <- df %>%
+  filter(!is.na(risk_s1)) %>%
+  select(all_of(model_vars)) %>%
+  summarise(across(everything(), ~sum(is.na(.)))) %>%
+  pivot_longer(everything(), names_to = "var", values_to = "n_missing") %>%
+  mutate(pct_missing = n_missing / sum(!is.na(df$risk_s1)) * 100) %>%
+  filter(n_missing > 0) %>%
+  arrange(desc(pct_missing))
+
+if (nrow(miss_report) > 0) {
+  print(miss_report, n = Inf)
+} else {
+  cat("No missing values in model variables\n")
+}
+
+# Compare complete vs dropped cases
+cat("\nComplete vs dropped comparison:\n")
+df_eligible <- df %>%
+  filter(!is.na(risk_s1)) %>%
+  select(all_of(c(model_vars, "province"))) %>%
+  mutate(in_model = complete.cases(across(all_of(model_vars))))
+
+compare <- df_eligible %>%
+  group_by(in_model) %>%
+  summarise(
+    n          = n(),
+    age_m      = mean(age, na.rm = TRUE),
+    female_pct = mean(female, na.rm = TRUE) * 100,
+    educ_m     = mean(educ_years, na.rm = TRUE),
+    rural_pct  = mean(rural, na.rm = TRUE) * 100,
+    .groups = "drop"
+  )
+
+print(compare, width = Inf)
+```
+
+## Multicollinearity Fix — Center Age
+
+`age` dan `age_sq` punya korelasi ~0.97 by construction → menghasilkan VIF yang tinggi dan koefisien yang tidak stabil. Standar fix: **center age di mean-nya** (`age_c = age - mean(age)`), lalu kuadratkan yang sudah center (`age_c2`). Hasilnya: korelasi `age_c` dengan `age_c2` jauh lebih rendah, interpretasi koefisien tetap valid (linear+quadratic effect of age). Update `demo_vars` dengan versi center.
+
+```{r multicon-fix}
+# --- Fix multicollinearity age/age_sq ---
+df_model <- df_model %>%
+  mutate(
+    age_c  = age - mean(age),
+    age_c2 = age_c^2
+  )
+
+# Update demo_vars
+demo_vars <- c("age_c", "age_c2", "female", "educ_years", "rural", "employed")
+
+# Rebuild formulas
+f_demo  <- reformulate(demo_vars, response = "risk_ord")
+f_psn   <- reformulate(c(psn_use, demo_vars), response = "risk_ord")
+f_cog   <- reformulate(c(cog_vars, demo_vars), response = "risk_ord")
+f_full  <- reformulate(c(psn_use, cog_vars, demo_vars), response = "risk_ord")
+f_trait <- reformulate(c(traits, demo_vars), response = "risk_ord")
+```
+
+## Baseline Regression — Ordered Logit
+
+Estimasi 5 spesifikasi nested untuk *incremental contribution test*:
+
+1. **demo_only** — baseline, hanya kontrol demografi
+2. **psn_items+demo** — tambah 15 item BFI mentah
+3. **cog+demo** — tambah 6 ukuran cognitive
+4. **full** — semua prediktor
+5. **trait_composites+demo** — pakai 5 trait composite alih-alih item mentah
+
+Kemudian bandingkan dengan **AIC/BIC** (lower = better) dan **likelihood ratio test** untuk nested comparison. Pertanyaan kunci: apakah trait composite atau item-level yang fit lebih baik? Kalau Δ AIC kecil, trait composite preferable (lebih parsimonious & interpretable).
+
+```{r regression}
+# --- B1. Model formulas ------------------------------------------------------
+
+f_demo    <- reformulate(demo_vars, response = "risk_ord")
+f_psn     <- reformulate(c(psn_use, demo_vars), response = "risk_ord")
+f_cog     <- reformulate(c(cog_vars, demo_vars), response = "risk_ord")
+f_full    <- reformulate(c(psn_use, cog_vars, demo_vars), response = "risk_ord")
+f_trait   <- reformulate(c(traits, demo_vars), response = "risk_ord")
+
+# --- B2. Ordered logit -------------------------------------------------------
+
+cat("\n================================================================\n")
+cat("ORDERED LOGIT RESULTS\n")
+cat("================================================================\n\n")
+
+m_demo  <- polr(f_demo, data = df_model, Hess = TRUE)
+m_psn   <- polr(f_psn,  data = df_model, Hess = TRUE)
+m_cog   <- polr(f_cog,  data = df_model, Hess = TRUE)
+m_full  <- polr(f_full, data = df_model, Hess = TRUE)
+m_trait <- polr(f_trait, data = df_model, Hess = TRUE)
+
+aic_table <- tibble(
+  model  = c("demo_only", "psn_items+demo", "cog+demo",
+             "full (items+cog+demo)", "trait_composites+demo"),
+  AIC    = c(AIC(m_demo), AIC(m_psn), AIC(m_cog), AIC(m_full), AIC(m_trait)),
+  BIC    = c(BIC(m_demo), BIC(m_psn), BIC(m_cog), BIC(m_full), BIC(m_trait)),
+  logLik = c(logLik(m_demo), logLik(m_psn), logLik(m_cog),
+             logLik(m_full), logLik(m_trait))
+) %>%
+  mutate(delta_AIC = AIC - min(AIC))
+
+cat("Model comparison:\n")
+print(aic_table, n = Inf, width = Inf)
+
+# LR tests: nested model comparisons
+cat("\nLikelihood ratio tests:\n")
+cat("Demo → +PSN items: ")
+print(anova(m_demo, m_psn))
+cat("Demo → +Cognitive: ")
+print(anova(m_demo, m_cog))
+cat("PSN items+demo → Full: ")
+print(anova(m_psn, m_full))
+cat("Trait composites vs raw items (both + demo):\n")
+cat(sprintf("  Trait AIC: %.1f | Item AIC: %.1f | Δ = %.1f\n",
+            AIC(m_trait), AIC(m_psn), AIC(m_trait) - AIC(m_psn)))
+
+# Full model coefficients
+full_tidy <- tidy(m_full, conf.int = FALSE) %>%
+  filter(coef.type == "coefficient") %>%
+  mutate(p.value = 2 * pnorm(abs(statistic), lower.tail = FALSE)) %>%
+  arrange(p.value)
+print(full_tidy, n = Inf)
+
+```
+
+## OLS Robustness Check
+
+Estimasi ulang model full dengan **OLS biasa** (target di-treat sebagai numeric). Tujuan:
+
+1. **Get R²** — `polr` tidak punya R², jadi OLS dipakai untuk dapat ukuran "berapa banyak variasi yang dijelaskan model" yang interpretable.
+2. **Cek konsistensi koefisien** — kalau pola signifikansi & arah koefisien serupa antara polr vs OLS, hasil robust ke pilihan model.
+3. **Standardized betas** — semua prediktor di-scale ke z-score, lalu re-fit. Output: ranking prediktor by **importance** (absolute std beta) — tidak bias oleh skala variabel.
+
+```{r OLS-Check}
+cat("\n================================================================\n")
+cat("OLS ROBUSTNESS CHECK\n")
+cat("================================================================\n\n")
+
+f_ols <- reformulate(c(psn_use, cog_vars, demo_vars), response = "risk_s1")
+m_ols <- lm(f_ols, data = df_model)
+
+cat("R²:", round(summary(m_ols)$r.squared, 4), "\n")
+cat("Adj R²:", round(summary(m_ols)$adj.r.squared, 4), "\n\n")
+
+ols_tidy <- tidy(m_ols) %>%
+  filter(term != "(Intercept)") %>%
+  arrange(p.value)
+
+cat("All predictors (sorted by p-value):\n")
+print(ols_tidy, n = Inf)
+
+# Standardized coefficients
+df_std <- df_model %>%
+  mutate(across(all_of(c(psn_use, cog_vars, "age", "educ_years")), scale))
+
+m_ols_std <- lm(f_ols, data = df_std)
+std_tidy <- tidy(m_ols_std) %>%
+  filter(term != "(Intercept)") %>%
+  arrange(desc(abs(estimate))) %>%
+  rename(std_beta = estimate)
+
+cat("\nStandardized betas (top 15):\n")
+print(head(std_tidy, 15))
+```
+
+## Average Marginal Effects (AME)
+
+Koefisien `polr` dalam log-odds — sulit di-interpret langsung. **AME** menghitung "rata-rata seberapa banyak prob masuk Group X berubah kalau prediktor naik 1 unit" — di skala probabilitas yang bisa langsung dibaca. Output di-pivot wide: 1 baris per prediktor, kolom per `risk_group` (1, 2, 3, 4) dengan estimate + p-value. Berguna untuk reporting di paper.
+
+```{r marginal-check}
+cat("\n================================================================\n")
+cat("AVERAGE MARGINAL EFFECTS (full ordered logit)\n")
+cat("================================================================\n\n")
+
+ame <- avg_slopes(m_full)
+ame_tbl <- ame %>%
+  as_tibble() %>%
+  select(term, group, estimate, std.error, p.value, conf.low, conf.high)
+
+# Pivot: one row per predictor, columns per risk group
+ame_wide <- ame_tbl %>%
+  mutate(group = paste0("risk_", group)) %>%
+  pivot_wider(
+    id_cols = term,
+    names_from = group,
+    values_from = c(estimate, p.value),
+    names_glue = "{group}_{.value}"
+  )
+
+cat("AME (selected predictors, all groups):\n")
+print(ame_wide, n = Inf, width = Inf)
+
+```
+
+## Save Results
+
+Bundle semua hasil (AIC table, fitted models, std betas, AME, correlation matrix, descriptive tables, KW tests, missing report) ke satu `results` list dan save ke `output/tables/baseline_results_18_65.rds`. Plus save `df_model` ke `model_ready_18_65.rds` supaya step lanjutan (robustness, ML model, dst.) tidak perlu re-run preprocessing.
+
+```{r save}
+# --- B5. Save ----------------------------------------------------------------
+
+saveRDS(df_model, "../data/processed/model_ready_18_65.rds")
+
+results <- list(
+  aic_table    = aic_table,
+  full_ologit  = m_full,
+  full_ols     = m_ols,
+  ols_std      = std_tidy,
+  ame          = ame_tbl,
+  cor_matrix   = cor_mat,
+  table1_cont  = table1_cont,
+  by_risk      = by_risk,
+  miss_report  = miss_report,
+  kw_tests     = kw_results
+)
+saveRDS(results, "../output/tables/baseline_results_18_65.rds")
+
+cat("\nDone. Saved model_ready.rds and baseline_results.rds\n")
+```
+
+## Brief Output Summary
+
+Quick check hasil tersimpan — buka kembali file results dan print 4 hal kunci: AIC table, OLS R², top-10 standardized betas, dan distribusi target. Berguna untuk recap cepat setelah re-run.
+
+```{r brief}
+# 1. AIC table
+print(readRDS("../output/tables/baseline_results_18_65.rds")$aic_table, width = Inf)
+
+# 2. OLS R²
+summary(readRDS("../output/tables/baseline_results_18_65.rds")$full_ols)$adj.r.squared
+
+# 3. Top 10 standardized betas
+head(readRDS("../output/tables/baseline_results_18_65.rds")$ols_std, 10)
+
+# 4. N complete cases & risk distribution
+table(readRDS("../data/processed/model_ready_18_65.rds")$risk_s1)
+```
