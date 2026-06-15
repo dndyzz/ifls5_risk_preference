@@ -21,3 +21,10 @@ Thumbs.db
 .Rhistory
 .RData
 .Ruserdata
+.Rproj.user/
+
+# === Temp / lock / backup files ===
+.RDataTmp*
+~$*
+*_ORIGINAL_backup.docx
+
