@@ -407,7 +407,7 @@ Estimasi ulang model full dengan **OLS biasa** (target di-treat sebagai numeric)
 
 1. **Get R²** — `polr` tidak punya R², jadi OLS dipakai untuk dapat ukuran "berapa banyak variasi yang dijelaskan model" yang interpretable.
 2. **Cek konsistensi koefisien** — kalau pola signifikansi & arah koefisien serupa antara polr vs OLS, hasil robust ke pilihan model.
-3. **Standardized betas** — semua prediktor di-scale ke z-score, lalu re-fit. Output: ranking prediktor by **importance** (absolute std beta) — tidak bias oleh skala variabel.
+3. **Standardized betas** — dihitung sebagai `b × SD(x) / SD(y)` untuk **semua** prediktor (termasuk binary dan age terms), konsisten dengan metode di robustness check (script 06) supaya kolom β comparable antar spesifikasi. Output: ranking prediktor by **importance** (absolute std beta) — tidak bias oleh skala variabel.
 
 ```{r OLS-Check}
 cat("\n================================================================\n")
@@ -427,15 +427,17 @@ ols_tidy <- tidy(m_ols) %>%
 cat("All predictors (sorted by p-value):\n")
 print(ols_tidy, n = Inf)
 
-# Standardized coefficients
-df_std <- df_model %>%
-  mutate(across(all_of(c(psn_use, cog_vars, "age", "educ_years")), scale))
+# Fully standardized coefficients: beta = b * sd(x) / sd(y), SE scaled identically
+mf   <- model.frame(m_ols)
+sd_y <- sd(mf$risk_s1)
 
-m_ols_std <- lm(f_ols, data = df_std)
-std_tidy <- tidy(m_ols_std) %>%
+std_tidy <- tidy(m_ols) %>%
   filter(term != "(Intercept)") %>%
-  arrange(desc(abs(estimate))) %>%
-  rename(std_beta = estimate)
+  mutate(sd_x     = map_dbl(term, ~ sd(mf[[.x]])),
+         std_beta = estimate * sd_x / sd_y,
+         std_se   = std.error * sd_x / sd_y) %>%
+  select(term, B = estimate, SE = std.error, std_beta, std_se, statistic, p.value) %>%
+  arrange(desc(abs(std_beta)))
 
 cat("\nStandardized betas (top 15):\n")
 print(head(std_tidy, 15))

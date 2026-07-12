@@ -28,3 +28,15 @@ Thumbs.db
 ~$*
 *_ORIGINAL_backup.docx
 
+
+# === Model objects & rendered reports (contain individual-level data) ===
+output/tables/
+output/*.html
+
+# === Unused placeholder scripts & exploratory drafts (kept locally) ===
+scripts/01_data_prep.R
+scripts/02_feature_engineering.R
+scripts/03_modeling.R
+scripts/04_export.R
+scripts/Inspection.Rmd
+scripts/robustness_check_5group (2).Rmd
