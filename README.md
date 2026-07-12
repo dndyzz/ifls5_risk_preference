@@ -51,3 +51,7 @@ Supporting scripts:
 ## Manuscript
 
 The current draft lives in `docs/Risk_Preference_Draft.docx`.
+
+## License
+
+The code in this repository is released under the [MIT License](LICENSE). The IFLS5 data are subject to RAND's data use agreement and are not covered by this license.
