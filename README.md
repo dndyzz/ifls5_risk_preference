@@ -38,10 +38,23 @@ Run the R Markdown scripts in `scripts/` in numbered order:
 | `05_Baseline_Model.Rmd` | Primary analysis: five nested ordered-logit specifications, OLS with fully standardized betas (b × SDx/SDy), average marginal effects → `output/tables/baseline_results_18_65.rds` |
 | `06_Robustness_Check_5Group.Rmd` | Re-estimates all specifications with gamble-averse respondents included as Group 0 → `output/tables/robustness_5group.rds` |
 
+Scripts `07`–`12` produce the results reported in the current manuscript. They are plain `.R` files and are run from the project root, in order, after `01`–`04` have produced the processed datasets:
+
+| Script | What it does |
+|---|---|
+| `07_comprehension_sample.R` | Rebuilds the analytic sample retaining **all** Set 1 screening outcomes, so comprehension and preference can be modeled separately. Adds the 3-level comprehension gradient (`correct` / `corrected` / `confirmed_dominated`), implied CRRA bounds, and a corrected education recode for sensitivity → `data/processed/comprehension_sample.rds` |
+| `08_core_models.R` | Brant test and cut-point-specific logits for proportional odds; household-clustered SEs; multinomial logit; the two-stage (comprehension → preference) decomposition; ordered model of the comprehension gradient → `output/tables/core_models.rds` |
+| `09_cv_and_noise.R` | 10-fold cross-validated model comparison with folds held at household level; analytic and simulated distribution for random responding through the Set 1 branching tree; interval regression on implied CRRA bounds → `output/tables/cv_and_noise.rds` |
+| `10_noise_test_and_supp.R` | Convergence of observed responses on the coin-flip prediction by cognitive quintile; extreme-response logit; full Set 2 analysis; BFI-15 psychometrics (mean inter-item r, Spearman-Brown) → `output/tables/noise_test_and_supp.rds` |
+| `11_figures_revised.R` | The four manuscript figures, 300-dpi PNG + vector PDF |
+| `12_crossset_stability.R` | Discriminating test between the noise and preference accounts: cross-set agreement by cognitive quintile and reproduction of extreme responses → `output/tables/crossset_stability.rds` |
+
 Supporting scripts:
 
 - `scripts/alpha_check_18-65.R` — Cronbach's alpha for the BFI-15 scales reported in the paper
 - `scripts/app.R` — Shiny demo that predicts risk-preference group probabilities
+
+Note that `05`/`06` reproduce the earlier draft's specifications and are retained for comparability; the sample-size reconciliation in `07` (13 respondents who passed screening but could not be scored) explains the small differences against them.
 
 ## Outputs
 
@@ -50,7 +63,8 @@ Supporting scripts:
 
 ## Manuscript
 
-The current draft lives in `docs/Risk_Preference_Draft.docx`.
+- `docs/Risk_Preference_Draft_v2.docx` — current draft (two-channel decomposition; scripts `07`–`12`)
+- `docs/Risk_Preference_Draft.docx` — earlier draft (personality vs. cognition comparison; scripts `01`–`06`)
 
 ## License
 
