@@ -48,6 +48,8 @@ Scripts `07`–`12` produce the results reported in the current manuscript. They
 | `10_noise_test_and_supp.R` | Convergence of observed responses on the coin-flip prediction by cognitive quintile; extreme-response logit; full Set 2 analysis; BFI-15 psychometrics (mean inter-item r, Spearman-Brown) → `output/tables/noise_test_and_supp.rds` |
 | `11_figures_revised.R` | The four manuscript figures, 300-dpi PNG + vector PDF |
 | `12_crossset_stability.R` | Discriminating test between the noise and preference accounts: cross-set agreement by cognitive quintile and reproduction of extreme responses → `output/tables/crossset_stability.rds` |
+| `13_selection_and_bootstrap.R` | Randomization check and effects of the randomized presentation order (`random_si`) on both channels; worst-case bounds on the preference channel under selection; Heckman two-step reported as a failed specification; 500-replicate paired household bootstrap for the cross-channel comparison → `output/tables/selection_bootstrap.rds` |
+| `14_crra_sensitivity.R` | Implied CRRA bounds and the interval regression re-derived under background consumption w = 0 to 5 times the certain amount → `output/tables/crra_sensitivity.rds` |
 
 Supporting scripts:
 
